@@ -172,3 +172,46 @@ A missing field lists what *is* present. A selector landing on an object lists
 its fields and suggests the deeper selector. A missing credential file says which
 file and what it is for — it is a **configuration** error, not an availability
 one, even though it surfaces before any HTTP request happens.
+
+## The image
+
+The releases page is for humans and for hosts. A build that wants `bm` inside an
+image takes it from the tailnet registry instead:
+
+```dockerfile
+COPY --from=registry.internal.astradx.com/baoist-monk:v0.2.0 /bm /usr/local/bin/bm
+```
+
+`FROM scratch`, so it is the binary and nothing else — not something to run. It
+is a **multi-arch manifest**, so `COPY --from` resolves whatever architecture the
+consuming build is running as.
+
+★ **There is no moving tag, on purpose.** Every other image in this fleet
+publishes one (`:dev`, `:latest`) because a deployment wants to follow a line.
+This is a *build input*: a moving tag would silently change what someone else's
+`COPY --from` resolves to, and the only evidence would be a base-image hash that
+moved for no reason in the diff. Pin the version.
+
+The image holds the **released** binary — the workflow downloads it from the job
+that publishes the release rather than rebuilding — so testing against the image
+is testing the release, by construction rather than by assumption.
+
+## Tests
+
+```bash
+go test ./...
+```
+
+The suite stands up a real HTTP server speaking the kv v2 shapes rather than
+mocking this package's own types, because the failures worth catching are all in
+the seams: the `data`/`metadata` segment inserted at the wrong position,
+`.data.data` unwrapped one level short, and a 403 reported as a network problem.
+A mock sees none of those.
+
+Two tests are load-bearing rather than incidental:
+
+- **serving from cache with Bao completely gone** — fetch once, close the
+  server, resolve again. If that ever fails, the reason for this tool is gone.
+- **a cache hit contacting nothing** — three references into one record must
+  cost one read, which is what makes per-operation resolution cheap enough to
+  replace a pre-rendered file.

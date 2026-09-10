@@ -1,12 +1,23 @@
-# Tag-driven releases, on GitHub's own runners.
+# Tag-driven releases: binaries on the releases page, and the same bytes pushed
+# to the tailnet registry as an image other builds can COPY --from.
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.2.0 && git push origin v0.2.0
 #
-# ── Why GitHub-hosted and not the fleet's runners ──────────────────────────
-# This builds a static binary from a module with NO dependencies. It needs a Go
-# toolchain and nothing else — no registry, no secrets, no access to the tailnet.
-# Sending it to the self-hosted runners would make it queue behind Elephant's
-# harness for no benefit.
+# ── Two jobs, on two different runners, and the split is the point ─────────
+# `release` needs a Go toolchain and nothing else — no registry, no secrets, no
+# tailnet. GitHub's runners do it without queueing behind Elephant's harness.
+#
+# `image` needs registry.internal.astradx.com, which has no auth because the
+# TAILNET is its boundary (see adx-servers/docker-registry/compose.yaml). A
+# GitHub-hosted runner cannot reach it at all, so that half can only ever run on
+# the magpie runners.
+#
+# ★ The image does NOT rebuild the binary; it downloads the one `release` just
+# built. So the image and the release asset are the same bytes by construction
+# rather than by assumption — which is what makes it honest for a consumer to
+# test against the image and call that a test of the release. Go builds are
+# reproducible in principle, but a different toolchain patch level is enough to
+# turn "the same" into "we assume so".
 name: release
 
 on:
@@ -40,6 +51,12 @@ jobs:
           VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           go vet ./...
           test -z "$(gofmt -l .)" || { echo "gofmt would change files:"; gofmt -l .; exit 1; }
+          # The suite runs a real HTTP server speaking kv v2 rather than mocking
+          # this package's own types, so it covers the three things that have
+          # actually gone wrong here: the data/metadata segment inserted in the
+          # wrong place, `.data.data` unwrapped one level short, and a 403
+          # reported as a network problem. -count=1 defeats the result cache.
+          go test -count=1 ./...
 
           mkdir -p dist
           # ★ CGO_ENABLED=0 — a STATIC binary. That is what lets one linux/amd64
@@ -83,3 +100,89 @@ jobs:
             --title "$VERSION" \
             --generate-notes \
             --verify-tag
+
+      # Hand the linux binaries to the `image` job. Not a re-download from the
+      # release: this repo is private, so pulling its assets back down would need
+      # a token on the self-hosted runner for bytes we already have in hand.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bm-linux
+          path: dist/bm-linux-*
+          retention-days: 1
+          if-no-files-found: error
+
+  # ── The image, on the fleet's runners ──────────────────────────────────────
+  image:
+    needs: release
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bm-linux
+          path: dist
+
+      - name: Build and push a multi-arch manifest
+        env:
+          REGISTRY: registry.internal.astradx.com
+          IMAGE_NAME: baoist-monk
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          IMG="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+
+          # download-artifact does not preserve the executable bit (the artifact
+          # is a zip, and zip has no notion of one). Harmless for a COPY into an
+          # image that is never run — but the consumer's `chmod +x` would then be
+          # load-bearing and invisible, so fix it at the source instead.
+          chmod +x dist/bm-linux-*
+
+          # A MANIFEST, not a single image: Elephant's base builds on both
+          # amd64 and arm64, and `COPY --from` resolves whatever arch the build
+          # is running as. A single-arch tag would work on the runners here and
+          # fail only on the arm64 leg — the worst place to find out.
+          podman manifest rm "$IMG" 2>/dev/null || true
+          podman manifest create "$IMG"
+          for arch in amd64 arm64; do
+            podman build \
+              --platform "linux/${arch}" \
+              --build-arg "BMARCH=${arch}" \
+              --manifest "$IMG" \
+              -f Containerfile .
+          done
+
+          # --all pushes every arch in the manifest, not just the one matching
+          # this host. Without it the arm64 entry is listed and unfetchable.
+          podman manifest push --all "$IMG" "docker://${IMG}"
+
+          # ★ NO moving tag. Every other image in this fleet publishes one
+          # (:dev, :latest) because a deployment wants to follow a line. This is
+          # a BUILD INPUT: a moving tag here would silently change what a
+          # `COPY --from` in someone else's Containerfile resolves to, and the
+          # only evidence would be a base-image hash that moved for no reason in
+          # the diff. Consumers pin the version, always.
+          echo "$IMG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prove the pushed image holds a working binary
+        env:
+          REGISTRY: registry.internal.astradx.com
+          IMAGE_NAME: baoist-monk
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          IMG="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+
+          # Pull it BACK from the registry and copy it out exactly the way a
+          # consumer's Containerfile will, rather than inspecting the local
+          # build. A manifest that pushed only half its arches, or a COPY that
+          # picked up a path that does not exist, both pass every check above
+          # and fail here.
+          workdir="$(mktemp -d)"
+          printf 'FROM docker.io/library/busybox:1.36\nCOPY --from=%s /bm /usr/local/bin/bm\nRUN /usr/local/bin/bm version\n' \
+            "$IMG" > "$workdir/Containerfile"
+          podman build --pull-always -t bm-verify -f "$workdir/Containerfile" "$workdir"
+          podman rmi bm-verify || true
+          rm -rf "$workdir"
