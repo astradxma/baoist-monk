@@ -59,6 +59,10 @@ import (
 
 const refPrefix = "bao:"
 
+// version is stamped by the release build (-X main.version). A build from a
+// working tree says so rather than claiming a version it does not have.
+var version = "dev"
+
 // ── Reference ───────────────────────────────────────────────────────────────
 
 // Ref is a parsed `bao:<path>#<selector>`.
@@ -512,6 +516,9 @@ func main() {
 	case "-h", "--help", "help":
 		usage()
 		return
+	case "version", "--version":
+		fmt.Println(version)
+		return
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
@@ -555,7 +562,7 @@ func unavailableErr(format string, a ...any) error {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `baoist-monk — resolve bao: references, cached locally
+	fmt.Fprint(os.Stderr, `bm (baoist-monk) — resolve bao: references, cached locally
 
   get <ref>                 print one value
   env NAME=<ref> [NAME=…]   print KEY=VALUE lines, for `+"`eval`"+` or a file

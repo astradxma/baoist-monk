@@ -1,0 +1,85 @@
+# Tag-driven releases, on GitHub's own runners.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# ── Why GitHub-hosted and not the fleet's runners ──────────────────────────
+# This builds a static binary from a module with NO dependencies. It needs a Go
+# toolchain and nothing else — no registry, no secrets, no access to the tailnet.
+# Sending it to the self-hosted runners would make it queue behind Elephant's
+# harness for no benefit.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (must already exist)'
+        required: true
+
+permissions:
+  contents: write   # required to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Vet and build every target
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          go vet ./...
+          test -z "$(gofmt -l .)" || { echo "gofmt would change files:"; gofmt -l .; exit 1; }
+
+          mkdir -p dist
+          # ★ CGO_ENABLED=0 — a STATIC binary. That is what lets one linux/amd64
+          # build run on glibc and musl alike, which is why there is no separate
+          # musl target here (and why OpenBao's own release has none either).
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            echo "building $os/$arch"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+                       -o "dist/bm-$os-$arch" .
+          done
+
+          # The binary is `bm`. The repo keeps the long name; the thing you type
+          # in a script does not.
+          cd dist
+          for f in bm-*; do sha256sum "$f" >> checksums.txt; done
+          cat checksums.txt
+
+      - name: Smoke-test the runner's own binary
+        run: |
+          set -euo pipefail
+          chmod +x dist/bm-linux-amd64
+          # A ref with no '#' must be a USAGE error (exit 2), and must say so
+          # rather than crashing. Cheap, and it catches a build that produced
+          # something that cannot even parse its own arguments.
+          set +e
+          out="$(./dist/bm-linux-amd64 get 'bao:kv/x' 2>&1)"; code=$?
+          set -e
+          echo "$out"
+          [ "$code" = "2" ] || { echo "expected exit 2 for a malformed ref, got $code"; exit 1; }
+          ./dist/bm-linux-amd64 --help >/dev/null
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release create "$VERSION" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "$VERSION" \
+            --generate-notes \
+            --verify-tag
