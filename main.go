@@ -74,20 +74,20 @@ type Ref struct {
 
 func ParseRef(s string) (Ref, error) {
 	if !strings.HasPrefix(s, refPrefix) {
-		return Ref{}, fmt.Errorf("not a bao: reference: %q", s)
+		return Ref{}, classedError{code: 2, msg: fmt.Sprintf("not a bao: reference (must start with %q): %q", refPrefix, s)}
 	}
 	body := strings.TrimPrefix(s, refPrefix)
 	hash := strings.Index(body, "#")
 	if hash < 0 {
-		return Ref{}, fmt.Errorf("reference %q has no '#': expected bao:<path>#<field>", s)
+		return Ref{}, classedError{code: 2, msg: fmt.Sprintf("reference %q has no '#'.\n\n  Expected  bao:<kv path>#<field>  e.g. bao:kv/adx/app/db#PASSWORD", s)}
 	}
 	path := strings.Trim(body[:hash], "/")
 	sel := body[hash+1:]
 	if path == "" {
-		return Ref{}, fmt.Errorf("reference %q has an empty path", s)
+		return Ref{}, classedError{code: 2, msg: fmt.Sprintf("reference %q has an empty kv path before the '#'", s)}
 	}
 	if sel == "" {
-		return Ref{}, fmt.Errorf("reference %q has an empty selector after '#'", s)
+		return Ref{}, classedError{code: 2, msg: fmt.Sprintf("reference %q has an empty selector after the '#'", s)}
 	}
 	return Ref{Path: path, Selector: strings.Split(sel, ".")}, nil
 }
@@ -113,13 +113,13 @@ func (r Ref) apply(data map[string]any) (string, error) {
 	for i, k := range r.Selector {
 		m, ok := cur.(map[string]any)
 		if !ok {
-			return "", fmt.Errorf("selector %q: %q is not an object",
-				strings.Join(r.Selector, "."), strings.Join(r.Selector[:i], "."))
+			return "", configErr("selector %q at %s: %q is a value, so it has no fields under it",
+				strings.Join(r.Selector, "."), r.Path, strings.Join(r.Selector[:i], "."))
 		}
 		cur, ok = m[k]
 		if !ok {
-			return "", fmt.Errorf("selector %q: no field %q at %s (present: %s)",
-				strings.Join(r.Selector, "."), k, r.Path, strings.Join(keysOf(m), ", "))
+			return "", configErr("selector %q at %s: no field %q.\n\n  Present: %s",
+				strings.Join(r.Selector, "."), r.Path, k, strings.Join(keysOf(m), ", "))
 		}
 	}
 	switch v := cur.(type) {
@@ -133,8 +133,18 @@ func (r Ref) apply(data map[string]any) (string, error) {
 		// ★ Never stringify an object. A credential that silently becomes
 		// `map[...]` is the empty-credential failure wearing a different hat: it
 		// would be handed to S3 and fail as a 403 inside a run, hours later.
-		return "", fmt.Errorf("selector %q at %s resolves to a %T, not a scalar",
-			strings.Join(r.Selector, "."), r.Path, cur)
+		sel := strings.Join(r.Selector, ".")
+		if m, ok := cur.(map[string]any); ok {
+			ks := keysOf(m)
+			hint := ""
+			if len(ks) > 0 {
+				hint = fmt.Sprintf("\n\n  Did you mean  #%s.%s ?", sel, ks[0])
+			}
+			return "", configErr("selector %q at %s is an OBJECT, not a value.\n\n  It has: %s%s",
+				sel, r.Path, strings.Join(ks, ", "), hint)
+		}
+		return "", configErr("selector %q at %s resolves to a %T, which is not a value",
+			sel, r.Path, cur)
 	}
 }
 
@@ -276,11 +286,19 @@ func (c *Client) login() (string, error) {
 	secFile := env("BAO_SECRET_ID_FILE", "/etc/bao/secret_id")
 	rid, err := os.ReadFile(roleFile)
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", roleFile, err)
+		return "", configErr(`cannot read the AppRole role_id at %s: %v
+
+  This host has no OpenBao credential. Place the pair issued for this node, or
+  point at them with BAO_ROLE_ID_FILE / BAO_SECRET_ID_FILE, or set BAO_TOKEN.`,
+			roleFile, err)
 	}
 	sid, err := os.ReadFile(secFile)
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", secFile, err)
+		return "", configErr(`cannot read the AppRole secret_id at %s: %v
+
+  role_id was found but secret_id was not — usually a half-placed credential
+  pair, or a secret_id consumed by an agent configured to delete it after
+  reading.`, secFile, err)
 	}
 	body, _ := json.Marshal(map[string]string{
 		"role_id":   strings.TrimSpace(string(rid)),
@@ -310,6 +328,38 @@ func (c *Client) login() (string, error) {
 	return c.token, nil
 }
 
+// baoErrText renders Bao's {"errors":[...]} payload as one line.
+//
+// The raw form is unreadable in a log: the API embeds a multierror, so a plain
+// dump gives `{"errors":["1 error occurred:\n\t* permission denied\n\n"]}`.
+// Callers see the message, not the envelope.
+func baoErrText(body []byte) string {
+	var out struct {
+		Errors []string `json:"errors"`
+	}
+	if json.Unmarshal(body, &out) == nil && len(out.Errors) > 0 {
+		var parts []string
+		for _, e := range out.Errors {
+			for _, line := range strings.Split(e, "\n") {
+				line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "*"))
+				// Drop multierror scaffolding like "1 error occurred:".
+				if line == "" || strings.HasSuffix(line, "error occurred:") {
+					continue
+				}
+				parts = append(parts, line)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "; ")
+		}
+	}
+	t := strings.TrimSpace(string(body))
+	if t == "" {
+		return "(no error body)"
+	}
+	return t
+}
+
 func (c *Client) getJSON(url string) (map[string]any, int, error) {
 	tok, err := c.login()
 	if err != nil {
@@ -323,8 +373,8 @@ func (c *Client) getJSON(url string) (map[string]any, int, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, resp.StatusCode, errors.New(baoErrText(b))
 	}
 	var out map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -335,9 +385,9 @@ func (c *Client) getJSON(url string) (map[string]any, int, error) {
 
 // fetch reads a path from Bao and caches it.
 func (c *Client) fetch(r Ref) (entry, error) {
-	raw, _, err := c.getJSON(r.dataURL(c.addr))
+	raw, status, err := c.getJSON(r.dataURL(c.addr))
 	if err != nil {
-		return entry{}, fmt.Errorf("read %s: %w", r.Path, err)
+		return entry{}, c.explain(r.Path, status, err)
 	}
 	d, _ := raw["data"].(map[string]any)
 	inner, _ := d["data"].(map[string]any)
@@ -371,6 +421,61 @@ func (c *Client) Resolve(r Ref) (string, error) {
 		return "", err
 	}
 	return r.apply(e.Data)
+}
+
+// explain turns a failed read into something a person can act on.
+//
+// ★ The 403 case matters most and is the least obvious: OpenBao returns 403 for
+// BOTH "your policy does not grant this" AND "this path does not exist",
+// deliberately, so that a token cannot probe for the existence of paths it
+// cannot read. A message that only says "permission denied" therefore sends
+// people to re-read a policy that is already correct.
+func (c *Client) explain(path string, status int, err error) error {
+	// ★ Already classified? Pass it through. Login failures (a missing role_id,
+	// an unreadable secret_id) surface with NO http status, and an earlier
+	// version therefore reported them as "cannot reach OpenBao" — sending the
+	// reader to check the network when the actual problem was a file that was
+	// never placed. Classification belongs to whoever knew what went wrong.
+	var ce classedError
+	if errors.As(err, &ce) {
+		return ce
+	}
+	switch status {
+	case 403:
+		return configErr(`cannot read %s: %v
+
+  OpenBao answers 403 for BOTH of these, and does not distinguish them:
+    - the policy does not grant read on this path
+    - the path does not exist
+
+  Check, in this order:
+    1. does the path exist?      bao kv get %s
+    2. does the policy grant it? it needs BOTH lines, because kv v2 splits them:
+         path "%s" { capabilities = ["read"] }
+         path "%s" { capabilities = ["read"] }   # only needed for `+"`watch`"+`
+    3. is the AppRole bound to that policy?`,
+			path, err, path, insertSeg(path, "data"), insertSeg(path, "metadata"))
+	case 404:
+		return configErr(`%s has no data (HTTP 404).
+
+  The mount is reachable and readable, so this is not a permissions problem —
+  the path has never been written, or every version of it was deleted.`, path)
+	case 0:
+		// No status: the request never completed.
+		cached := "and nothing is cached for it"
+		if _, ok := c.cache.get(path); ok {
+			cached = "though a cached copy exists (this should not have been reached)"
+		}
+		return unavailableErr(`cannot reach OpenBao at %s %s.
+
+  %v
+
+  A provisioned deployment keeps working from cache; reaching this means this
+  path has never been fetched on this host. If Bao is SEALED it must be unsealed
+  by hand — it does not auto-unseal.`, c.addr, cached, err)
+	default:
+		return configErr("read %s: HTTP %d: %v", path, status, err)
+	}
 }
 
 // currentVersion asks only for METADATA — cheap, and it does not transfer the
@@ -412,8 +517,41 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "baoist-monk: "+err.Error())
-		os.Exit(1)
+		os.Exit(exitCodeFor(err))
 	}
+}
+
+// Exit codes exist so a CALLER can act without parsing prose:
+//
+//	2  usage — a malformed reference or wrong arguments
+//	3  configuration — the path, the field or the permission is wrong. Retrying
+//	   will not help; something has to change.
+//	4  unavailable — Bao could not be reached and nothing was cached. Retrying
+//	   MIGHT help, which is exactly the distinction a supervisor needs.
+//	1  anything else
+//
+// A script that treats 3 and 4 the same will either retry a typo forever or give
+// up on a network blip.
+func exitCodeFor(err error) int {
+	var ce classedError
+	if errors.As(err, &ce) {
+		return ce.code
+	}
+	return 1
+}
+
+type classedError struct {
+	code int
+	msg  string
+}
+
+func (e classedError) Error() string { return e.msg }
+
+func configErr(format string, a ...any) error {
+	return classedError{code: 3, msg: fmt.Sprintf(format, a...)}
+}
+func unavailableErr(format string, a ...any) error {
+	return classedError{code: 4, msg: fmt.Sprintf(format, a...)}
 }
 
 func usage() {
