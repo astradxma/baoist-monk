@@ -1,3 +1,4 @@
 baoist-monk
 *.tmp
 /dist/
+/bm-smoke

@@ -179,28 +179,31 @@ its fields and suggests the deeper selector. A missing credential file says whic
 file and what it is for — it is a **configuration** error, not an availability
 one, even though it surfaces before any HTTP request happens.
 
-## The image
+## Using `bm` inside another image
 
-The releases page is for humans and for hosts. A build that wants `bm` inside an
-image takes it from the tailnet registry instead:
+A build that wants `bm` in its image takes the released tarball, pinned to a
+version, and verifies it against `checksums.txt`. No registry, no token, no
+self-hosted runner — the releases page is public.
 
 ```dockerfile
-COPY --from=registry.internal.astradx.com/baoist-monk:v0.2.0 /bm /usr/local/bin/bm
+ARG BM_VERSION=0.3.0
+ARG TARGETARCH
+RUN curl -fsSL "https://github.com/astradxma/baoist-monk/releases/download/v${BM_VERSION}/baoist-monk_${BM_VERSION}_linux_${TARGETARCH}.tar.gz" \
+      | tar xz -C /usr/local/bin bm
 ```
 
-`FROM scratch`, so it is the binary and nothing else — not something to run. It
-is a **multi-arch manifest**, so `COPY --from` resolves whatever architecture the
-consuming build is running as.
+`TARGETARCH` is set by buildx from `--platform`, so the same line serves an
+amd64 and an arm64 build.
 
-★ **There is no moving tag, on purpose.** Every other image in this fleet
-publishes one (`:dev`, `:latest`) because a deployment wants to follow a line.
-This is a *build input*: a moving tag would silently change what someone else's
-`COPY --from` resolves to, and the only evidence would be a base-image hash that
-moved for no reason in the diff. Pin the version.
+★ **Pin the version.** This is a *build input*: pointing at `latest` would
+silently change what someone else's image contains, and the only evidence would
+be a hash that moved for no reason in the diff. There is deliberately no moving
+tag anywhere in this project's releases.
 
-The image holds the **released** binary — the workflow downloads it from the job
-that publishes the release rather than rebuilding — so testing against the image
-is testing the release, by construction rather than by assumption.
+(Releases up to v0.2.0 also published a `FROM scratch` image on the tailnet
+registry for `COPY --from`. That stopped at v0.3.0: the org's self-hosted
+runners rightly refuse public repositories, and the tarball does the same job
+without one.)
 
 ## Tests
 
