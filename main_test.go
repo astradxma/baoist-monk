@@ -593,3 +593,179 @@ func TestExitCodes(t *testing.T) {
 		}
 	}
 }
+
+// ── Token renewal ───────────────────────────────────────────────────────────
+//
+// ★ The bug these cover, in full: `login()` caches its token for the life of the
+// process. `bm get` never met that — it is a fresh process every time — but
+// `bm watch` runs for days against an AppRole whose token_ttl is 20 MINUTES. So
+// the watcher worked for one TTL and then failed every poll forever, printing
+// "keeping cached copy" on every path: the message that means "all is well, I am
+// riding this out". A dead watcher was indistinguishable from a healthy one.
+//
+// Nothing caught it because every existing test used a client for one call.
+
+// expiringBao accepts exactly one token and rejects every earlier one with 403,
+// which is what an expired lease looks like from the client side.
+type expiringBao struct {
+	*fakeBao
+	live    string // the only token currently accepted
+	logins  int64
+	rejects int64
+}
+
+func newExpiringBao(t *testing.T) *expiringBao {
+	t.Helper()
+	e := &expiringBao{fakeBao: &fakeBao{
+		secrets: map[string]map[string]any{},
+		forbid:  map[string]bool{},
+		version: 1,
+	}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/approle/login", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt64(&e.logins, 1)
+		e.live = fmt.Sprintf("s.token-%d", n)
+		writeJSON(w, 200, map[string]any{"auth": map[string]any{"client_token": e.live}})
+	})
+	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Vault-Token") != e.live {
+			atomic.AddInt64(&e.rejects, 1)
+			baoError(w, 403, "permission denied")
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/v1/")
+		parts := strings.SplitN(rest, "/", 3)
+		if len(parts) < 3 {
+			baoError(w, 404, "")
+			return
+		}
+		logical := parts[0] + "/" + parts[2]
+		if e.forbid[logical] {
+			baoError(w, 403, "permission denied")
+			return
+		}
+		data, ok := e.secrets[logical]
+		if !ok {
+			baoError(w, 404, "")
+			return
+		}
+		if parts[1] == "metadata" {
+			writeJSON(w, 200, map[string]any{"data": map[string]any{"current_version": e.version}})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"data": map[string]any{
+			"data": data, "metadata": map[string]any{"version": e.version}}})
+	})
+	e.srv = httptest.NewServer(mux)
+	t.Cleanup(e.srv.Close)
+	return e
+}
+
+func (e *expiringBao) expire() { e.live = "s.expired-and-gone" }
+
+func expiringClient(t *testing.T, e *expiringBao) *Client {
+	t.Helper()
+	dir := t.TempDir()
+	creds := t.TempDir()
+	if err := os.WriteFile(filepath.Join(creds, "role_id"), []byte("rid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(creds, "secret_id"), []byte("sid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BAO_ADDR", e.srv.URL)
+	t.Setenv("BAO_TOKEN", "")
+	t.Setenv("BAOIST_CACHE", dir)
+	t.Setenv("BAO_ROLE_ID_FILE", filepath.Join(creds, "role_id"))
+	t.Setenv("BAO_SECRET_ID_FILE", filepath.Join(creds, "secret_id"))
+	return NewClient()
+}
+
+// ★★ The regression test. A long-lived client whose token expires must log in
+// again and keep working — not fail every call for the rest of the process.
+func TestExpiredTokenIsRenewedOnTheNextCall(t *testing.T) {
+	e := newExpiringBao(t)
+	e.secrets["kv/adx/app"] = map[string]any{"X": "1"}
+	c := expiringClient(t, e)
+
+	if _, err := c.currentVersion("kv/adx/app"); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if n := atomic.LoadInt64(&e.logins); n != 1 {
+		t.Fatalf("%d logins for the first call, want 1", n)
+	}
+
+	e.expire()
+
+	if _, err := c.currentVersion("kv/adx/app"); err != nil {
+		t.Fatalf("after the token expired the client gave up instead of renewing: %v", err)
+	}
+	if n := atomic.LoadInt64(&e.logins); n != 2 {
+		t.Errorf("%d logins after expiry, want 2 — the token was not renewed", n)
+	}
+}
+
+// A 403 on a path the policy genuinely does not grant must still be reported,
+// not retried forever. One renewal attempt, then the error.
+func TestGenuineForbiddenStillFailsAfterOneRenewal(t *testing.T) {
+	e := newExpiringBao(t)
+	e.secrets["kv/adx/app"] = map[string]any{"X": "1"}
+	c := expiringClient(t, e)
+	if _, err := c.currentVersion("kv/adx/app"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A path the policy genuinely denies — denied no matter how fresh the token
+	// is, which is what separates "expired" from "not granted".
+	e.forbid["kv/adx/app"] = true
+	before := atomic.LoadInt64(&e.logins)
+	if _, err := c.currentVersion("kv/adx/app"); err == nil {
+		t.Fatal("a permanent 403 resolved")
+	}
+	if got := atomic.LoadInt64(&e.logins) - before; got != 1 {
+		t.Errorf("%d extra logins on a permanent 403, want exactly 1", got)
+	}
+}
+
+// A caller-supplied BAO_TOKEN must NOT trigger a re-login: login() hands the same
+// value straight back, so the retry is a guaranteed-identical second 403.
+func TestStaticBaoTokenIsNotRetried(t *testing.T) {
+	f := newFakeBao(t)
+	f.forbid["kv/adx/nope"] = true
+	c := testClient(t, f) // sets BAO_TOKEN
+	before := atomic.LoadInt64(&f.logins)
+	_, _ = c.Resolve(mustParse(t, "bao:kv/adx/nope#X"))
+	if got := atomic.LoadInt64(&f.logins) - before; got != 0 {
+		t.Errorf("%d logins with a static BAO_TOKEN, want 0", got)
+	}
+}
+
+// ★ refreshAll reports COUNTS so a total failure is distinguishable from one bad
+// path. Losing every path means the watcher is broken; losing one means a grant
+// is. They read identically per-path, which is how a dead watcher hid.
+func TestRefreshAllReportsTotalFailureSeparately(t *testing.T) {
+	f := newFakeBao(t)
+	f.secrets["kv/adx/one"] = map[string]any{"X": "1"}
+	f.secrets["kv/adx/two"] = map[string]any{"X": "2"}
+	c := testClient(t, f)
+	for _, p := range []string{"one", "two"} {
+		if _, err := c.Resolve(mustParse(t, "bao:kv/adx/"+p+"#X")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, failed, total := c.refreshAll()
+	if total != 2 || failed != 0 {
+		t.Errorf("healthy: failed=%d total=%d, want 0/2", failed, total)
+	}
+
+	f.forbid["kv/adx/one"] = true
+	if _, failed, total = c.refreshAll(); failed != 1 || total != 2 {
+		t.Errorf("one bad path: failed=%d total=%d, want 1/2", failed, total)
+	}
+
+	f.srv.Close() // Bao gone entirely
+	if _, failed, total = c.refreshAll(); failed != total || total == 0 {
+		t.Errorf("all gone: failed=%d total=%d, want failed==total>0", failed, total)
+	}
+}

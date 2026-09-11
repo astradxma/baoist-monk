@@ -80,6 +80,18 @@ cache *and* the failing one serving its last known value. Losing a credential
 because Bao was briefly unreachable would be strictly worse than serving a stale
 one.
 
+★ **And the token renews itself.** `get` is a fresh process, so it never met
+this; `watch` runs for days against an AppRole whose token TTL is typically
+minutes. A 403 therefore drops the cached token and retries the login once —
+without that, a watcher worked for exactly one TTL and then failed every poll
+forever, printing *"keeping cached copy"* on every path. That is the correct,
+reassuring message for a sealed Bao, which is precisely why a dead watcher was
+indistinguishable from a healthy one.
+
+★ **A cycle where EVERY path fails says so, loudly**, separately from the
+per-path lines. One unreadable path is a grant problem; all of them at once is
+the watcher being broken, and the two read identically one line at a time.
+
 The `--on-change` command receives `BAOIST_CHANGED` (`path v1->v2, …`) so it can
 act narrowly.
 

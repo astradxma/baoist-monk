@@ -364,7 +364,49 @@ func baoErrText(body []byte) string {
 	return t
 }
 
+// getJSON does one authenticated GET, renewing an expired token once.
+//
+// ★ WHY THE RETRY EXISTS. `bm get` is a fresh process and logs in fresh, so it
+// never met this. `bm watch` is LONG-LIVED and login() caches its token for the
+// life of the process — so once the AppRole's token_ttl elapsed (20m on
+// elephant-imaging) every poll failed forever, and the watcher sat there
+// printing "keeping cached copy" on every path, every cycle.
+//
+// That message is the correct, reassuring one for a sealed Bao or a revoked
+// grant. A DEAD WATCHER therefore looked exactly like a healthy watcher riding
+// out a blip: it had stopped watching and said nothing was wrong. Observed
+// 2026-09-11, ~20 minutes after the sidecar started.
+//
+// A 403 is also what Bao returns for a genuinely ungranted path, so this costs
+// one extra round trip on that error path. Worth it: the alternative is a
+// credential plane that silently stops propagating rotations.
 func (c *Client) getJSON(url string) (map[string]any, int, error) {
+	out, status, err := c.getOnce(url)
+	if status != 403 || !c.forgetToken() {
+		return out, status, err
+	}
+	return c.getOnce(url)
+}
+
+// forgetToken drops a cached AppRole token so the next call logs in again.
+//
+// Returns false when there is nothing to renew — a caller-supplied BAO_TOKEN is
+// handed straight back by login(), so retrying with it is a guaranteed-identical
+// second 403.
+func (c *Client) forgetToken() bool {
+	if os.Getenv("BAO_TOKEN") != "" {
+		return false
+	}
+	c.tokMu.Lock()
+	defer c.tokMu.Unlock()
+	if c.token == "" {
+		return false
+	}
+	c.token = ""
+	return true
+}
+
+func (c *Client) getOnce(url string) (map[string]any, int, error) {
 	tok, err := c.login()
 	if err != nil {
 		return nil, 0, err
@@ -690,7 +732,16 @@ func cmdWatch(args []string) error {
 	c := NewClient()
 	fmt.Printf("watching %d cached path(s) every %s\n", len(c.cache.paths()), interval)
 	for {
-		changed := c.refreshAll()
+		changed, failed, total := c.refreshAll()
+		// ★ A watcher that cannot read ANYTHING is not watching. Say so, instead
+		// of leaving a reader to notice that the same N lines repeat forever.
+		if total > 0 && failed == total {
+			fmt.Fprintf(os.Stderr,
+				"baoist-monk: ALL %d path(s) failed this cycle — NOTHING is being refreshed. "+
+					"Cached values still serve, but no rotation will ever reach this host. "+
+					"If these are 403s the token may be dead; if they are network errors Bao is unreachable.\n",
+				total)
+		}
 		if len(changed) > 0 {
 			fmt.Printf("changed: %s\n", strings.Join(changed, ", "))
 			if onChange != "" {
@@ -720,11 +771,17 @@ func cmdWatch(args []string) error {
 // serving from cache, and leaves the failing one serving its last known value
 // too. Losing a credential because Bao was briefly unreachable would be strictly
 // worse than serving a stale one.
-func (c *Client) refreshAll() []string {
-	var changed []string
+// refreshAll returns what changed, plus how many paths failed out of how many
+// were tried. The COUNTS matter: a per-path "keeping cached copy" line is the
+// right message for one unreadable path and a terrible one for all of them,
+// because losing every path at once means the watcher itself is broken rather
+// than one grant being wrong.
+func (c *Client) refreshAll() (changed []string, failed, total int) {
 	for _, p := range c.cache.paths() {
+		total++
 		cur, err := c.currentVersion(p)
 		if err != nil {
+			failed++
 			fmt.Fprintf(os.Stderr, "baoist-monk: %s: %v (keeping cached copy)\n", p, err)
 			continue
 		}
@@ -733,10 +790,11 @@ func (c *Client) refreshAll() []string {
 			continue
 		}
 		if _, err := c.fetch(Ref{Path: p}); err != nil {
+			failed++
 			fmt.Fprintf(os.Stderr, "baoist-monk: %s: %v (keeping cached copy)\n", p, err)
 			continue
 		}
 		changed = append(changed, fmt.Sprintf("%s v%d->v%d", p, old.Version, cur))
 	}
-	return changed
+	return changed, failed, total
 }
