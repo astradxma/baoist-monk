@@ -1,2 +1,3 @@
 baoist-monk
 *.tmp
+/dist/

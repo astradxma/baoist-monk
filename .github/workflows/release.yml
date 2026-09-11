@@ -1,18 +1,19 @@
-# Tag-driven releases: binaries on the releases page, and the same bytes pushed
+# Tag-driven releases: tarballs on the releases page, and the same bytes pushed
 # to the tailnet registry as an image other builds can COPY --from.
 #
-#   git tag v0.2.0 && git push origin v0.2.0
+#   git tag v0.3.0 && git push origin v0.3.0
 #
 # ── Two jobs, on two different runners, and the split is the point ─────────
 # `release` needs a Go toolchain and nothing else — no registry, no secrets, no
 # tailnet. GitHub's runners do it without queueing behind Elephant's harness.
+# GoReleaser produces the same shape lazygit and gh ship in (see .goreleaser.yaml).
 #
 # `image` needs registry.internal.astradx.com, which has no auth because the
 # TAILNET is its boundary (see adx-servers/docker-registry/compose.yaml). A
 # GitHub-hosted runner cannot reach it at all, so that half can only ever run on
 # the magpie runners.
 #
-# ★ The image does NOT rebuild the binary; it downloads the one `release` just
+# ★ The image does NOT rebuild the binary; it receives the one `release` just
 # built. So the image and the release asset are the same bytes by construction
 # rather than by assumption — which is what makes it honest for a consumer to
 # test against the image and call that a test of the release. Go builds are
@@ -22,15 +23,15 @@ name: release
 
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build and release (must already exist)'
+        description: "Tag to build and release (must already exist)"
         required: true
 
 permissions:
-  contents: write   # required to create the release
+  contents: write # required to create the release
 
 jobs:
   release:
@@ -39,16 +40,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
-          fetch-depth: 0
+          fetch-depth: 0 # goreleaser needs tags and history for the changelog
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
 
-      - name: Vet and build every target
+      - name: Vet, format, test
         run: |
           set -euo pipefail
-          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           go vet ./...
           test -z "$(gofmt -l .)" || { echo "gofmt would change files:"; gofmt -l .; exit 1; }
           # The suite runs a real HTTP server speaking kv v2 rather than mocking
@@ -58,56 +58,50 @@ jobs:
           # reported as a network problem. -count=1 defeats the result cache.
           go test -count=1 ./...
 
-          mkdir -p dist
-          # ★ CGO_ENABLED=0 — a STATIC binary. That is what lets one linux/amd64
-          # build run on glibc and musl alike, which is why there is no separate
-          # musl target here (and why OpenBao's own release has none either).
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            os="${target%/*}"; arch="${target#*/}"
-            echo "building $os/$arch"
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-              go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
-                       -o "dist/bm-$os-$arch" .
-          done
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          # The binary is `bm`. The repo keeps the long name; the thing you type
-          # in a script does not.
-          cd dist
-          for f in bm-*; do sha256sum "$f" >> checksums.txt; done
-          cat checksums.txt
+      # The Containerfile's contract is `dist/bm-linux-${BMARCH}`. Pull the linux
+      # binaries back out of the archives GoReleaser just published, rather than
+      # reaching into its build directories (whose names carry toolchain
+      # suffixes like `_v1` / `_v8.0` and are not a stable interface).
+      - name: Lay out the linux binaries for the image job
+        run: |
+          set -euo pipefail
+          mkdir -p image
+          for arch in amd64 arm64; do
+            tar xzf dist/baoist-monk_*_linux_${arch}.tar.gz -C image bm
+            mv image/bm "image/bm-linux-${arch}"
+          done
+          ls -l image/
 
       - name: Smoke-test the runner's own binary
         run: |
           set -euo pipefail
-          chmod +x dist/bm-linux-amd64
+          chmod +x image/bm-linux-amd64
           # A ref with no '#' must be a USAGE error (exit 2), and must say so
           # rather than crashing. Cheap, and it catches a build that produced
           # something that cannot even parse its own arguments.
           set +e
-          out="$(./dist/bm-linux-amd64 get 'bao:kv/x' 2>&1)"; code=$?
+          out="$(./image/bm-linux-amd64 get 'bao:kv/x' 2>&1)"; code=$?
           set -e
           echo "$out"
           [ "$code" = "2" ] || { echo "expected exit 2 for a malformed ref, got $code"; exit 1; }
-          ./dist/bm-linux-amd64 --help >/dev/null
+          ./image/bm-linux-amd64 --help >/dev/null
+          ./image/bm-linux-amd64 version
 
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
-          gh release create "$VERSION" dist/* \
-            --repo "${{ github.repository }}" \
-            --title "$VERSION" \
-            --generate-notes \
-            --verify-tag
-
-      # Hand the linux binaries to the `image` job. Not a re-download from the
-      # release: this repo is private, so pulling its assets back down would need
-      # a token on the self-hosted runner for bytes we already have in hand.
+      # Hand the linux binaries to the `image` job. The repo is public now, so a
+      # download from the release would also work — but these are the bytes
+      # already in hand, and passing them directly leaves nothing to assume.
       - uses: actions/upload-artifact@v4
         with:
           name: bm-linux
-          path: dist/bm-linux-*
+          path: image/bm-linux-*
           retention-days: 1
           if-no-files-found: error
 

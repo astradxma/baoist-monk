@@ -1,0 +1,58 @@
+# GoReleaser — the release shape lazygit, gh and most small Go tools ship in.
+# Same config as astradxma/zulip-smtp, minus the image: bm's image is a build
+# input for Elephant, lives on the tailnet registry, and is built by release.yml's
+# `image` job from the binaries this produces.
+#
+# A pushed tag `vX.Y.Z` produces, on GitHub-hosted runners:
+#
+#   * statically linked `bm` for linux/darwin × amd64/arm64, as .tar.gz
+#   * checksums.txt
+#   * a GitHub Release with generated notes
+#
+# Try it without publishing anything:
+#   go run github.com/goreleaser/goreleaser/v2@latest release --snapshot --clean --skip=publish
+
+version: 2
+project_name: baoist-monk
+
+builds:
+  - id: bm
+    main: .
+    # The repo keeps the long name; the thing you type in a script does not.
+    binary: bm
+    env:
+      - CGO_ENABLED=0 # a STATIC binary: one linux build runs on glibc and musl alike
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: tarballs
+    formats: [tar.gz]
+    # baoist-monk_0.3.0_linux_amd64.tar.gz, containing `bm`
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  github:
+    owner: astradxma
+    name: baoist-monk
+  draft: false
+  prerelease: auto

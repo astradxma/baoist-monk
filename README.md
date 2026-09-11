@@ -111,15 +111,21 @@ A read needs `read` on `kv/data/<path>`; `watch` also needs `read` on
 
 ## Install
 
-Binaries are published per tag on the
-[releases page](https://github.com/astradxma/baoist-monk/releases) — `bm-<os>-<arch>`
-plus `checksums.txt`. The binary is **`bm`**; the repo keeps the long name, the
-thing you type in a script does not.
+Every tag publishes statically linked binaries for linux and macOS, amd64 and
+arm64, as `.tar.gz` plus `checksums.txt` on the
+[releases page](https://github.com/astradxma/baoist-monk/releases) — the same
+shape lazygit and gh ship in. The binary inside is **`bm`**; the repo keeps the
+long name, the thing you type in a script does not.
 
 ```bash
-curl -fsSLO https://github.com/astradxma/baoist-monk/releases/download/v0.1.0/bm-linux-amd64
-install -m 0755 bm-linux-amd64 /usr/local/bin/bm
+curl -fsSL https://github.com/astradxma/baoist-monk/releases/latest/download/baoist-monk_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz \
+  | tar xz bm
+install -m 0755 bm /usr/local/bin/bm
 ```
+
+Assets are named `baoist-monk_<version>_<os>_<arch>.tar.gz`; substitute a
+version for `latest` to pin. (Releases before v0.3.0 shipped bare `bm-<os>-<arch>`
+binaries instead.)
 
 ## Build
 
