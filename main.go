@@ -112,18 +112,23 @@ func insertSeg(path, seg string) string {
 }
 
 // apply walks the selector over a decoded secret payload.
+//
+// A selector naming something the payload does not have comes back as an
+// absentErr, so Resolve can tell "this copy lacks the field" — which a newer
+// version might fix — from "the field is there and is the wrong shape", which
+// no re-fetch will.
 func (r Ref) apply(data map[string]any) (string, error) {
 	var cur any = data
 	for i, k := range r.Selector {
 		m, ok := cur.(map[string]any)
 		if !ok {
-			return "", configErr("selector %q at %s: %q is a value, so it has no fields under it",
-				strings.Join(r.Selector, "."), r.Path, strings.Join(r.Selector[:i], "."))
+			return "", absentErr{configErr("selector %q at %s: %q is a value, so it has no fields under it",
+				strings.Join(r.Selector, "."), r.Path, strings.Join(r.Selector[:i], "."))}
 		}
 		cur, ok = m[k]
 		if !ok {
-			return "", configErr("selector %q at %s: no field %q.\n\n  Present: %s",
-				strings.Join(r.Selector, "."), r.Path, k, strings.Join(keysOf(m), ", "))
+			return "", absentErr{configErr("selector %q at %s: no field %q.\n\n  Present: %s",
+				strings.Join(r.Selector, "."), r.Path, k, strings.Join(keysOf(m), ", "))}
 		}
 	}
 	switch v := cur.(type) {
@@ -151,6 +156,12 @@ func (r Ref) apply(data map[string]any) (string, error) {
 			sel, r.Path, cur)
 	}
 }
+
+// absentErr wraps the configuration error for a selector the payload does not
+// contain. It unwraps to the classedError, so the exit code is still 3.
+type absentErr struct{ error }
+
+func (e absentErr) Unwrap() error { return e.error }
 
 func keysOf(m map[string]any) []string {
 	out := make([]string, 0, len(m))
@@ -431,6 +442,20 @@ func (c *Client) getOnce(url string) (map[string]any, int, error) {
 
 // fetch reads a path from Bao and caches it.
 func (c *Client) fetch(r Ref) (entry, error) {
+	e, err := c.read(r)
+	if err != nil {
+		return entry{}, err
+	}
+	if err := c.cache.put(e); err != nil {
+		return e, fmt.Errorf("cache %s: %w", r.Path, err)
+	}
+	return e, nil
+}
+
+// read fetches a path from Bao WITHOUT touching the cache. Split from fetch so
+// that a failed read provably cannot evict or alter a cached copy, and so a
+// failed read and a failed cache write are never reported as the same thing.
+func (c *Client) read(r Ref) (entry, error) {
 	raw, status, err := c.getJSON(r.dataURL(c.addr))
 	if err != nil {
 		return entry{}, c.explain(r.Path, status, err)
@@ -446,11 +471,7 @@ func (c *Client) fetch(r Ref) (entry, error) {
 			ver = int(v)
 		}
 	}
-	e := entry{Path: r.Path, Version: ver, Data: inner, Fetched: time.Now().UTC()}
-	if err := c.cache.put(e); err != nil {
-		return e, fmt.Errorf("cache %s: %w", r.Path, err)
-	}
-	return e, nil
+	return entry{Path: r.Path, Version: ver, Data: inner, Fetched: time.Now().UTC()}, nil
 }
 
 // Resolve returns the value for a ref, preferring the cache.
@@ -458,15 +479,60 @@ func (c *Client) fetch(r Ref) (entry, error) {
 // ★ A cache hit does NOT contact Bao. That is what makes resolution cheap enough
 // to do per-operation, and what makes a sealed Bao invisible to a running
 // deployment. Freshness is the watcher's job, not the reader's.
+//
+// ★ EXCEPT when the cached copy lacks the field asked for. That is not a hit:
+// the copy cannot answer the question, so serving its "no field" verdict would
+// be serving a stale NEGATIVE. It is exactly what happens when a field is added
+// to a path that is already cached — observed 2026-10-23 on theserver, where
+// RUNNER_SECRET_SEAGULL_CI was added to kv/adx/forgejo/app two days after the
+// path was first cached and `bm get` reported it missing until someone deleted
+// the cache file by hand. `watch` would have caught it eventually, but only on
+// hosts running one and only after a poll; a reader cannot wait for that.
+//
+// So a miss on the FIELD re-fetches the path once. A cache hit on a present
+// field still never contacts Bao.
 func (c *Client) Resolve(r Ref) (string, error) {
-	if e, ok := c.cache.get(r.Path); ok {
+	e, ok := c.cache.get(r.Path)
+	if !ok {
+		e, err := c.fetch(r)
+		if err != nil {
+			return "", err
+		}
 		return r.apply(e.Data)
 	}
-	e, err := c.fetch(r)
-	if err != nil {
-		return "", err
+	v, err := r.apply(e.Data)
+	var absent absentErr
+	if !errors.As(err, &absent) {
+		return v, err
 	}
-	return r.apply(e.Data)
+	return c.refreshForField(r, e, absent)
+}
+
+// refreshForField re-reads a cached path whose copy lacks the selector.
+//
+// ★ A failed refresh leaves the cache exactly as it was. Bao being sealed must
+// never cost a host the fields it DOES have. The failure is still exit 3 — the
+// field is missing from everything this host can see, and retrying will not
+// help until Bao is back — but it says the copy is cached and stale-possible,
+// rather than flatly claiming the field does not exist.
+func (c *Client) refreshForField(r Ref, cached entry, absent absentErr) (string, error) {
+	fresh, err := c.read(r)
+	if err != nil {
+		return "", configErr(`%v
+  (from the cached copy of %s, v%d fetched %s)
+
+  The cached copy lacks this field, and OpenBao could not be reached to refresh
+  it — the field may have been added since. The cache was left untouched.
+
+  Refresh failed with: %v`,
+			absent.error, r.Path, cached.Version, cached.Fetched.Format(time.RFC3339), err)
+	}
+	if err := c.cache.put(fresh); err != nil {
+		return "", fmt.Errorf("cache %s: %w", r.Path, err)
+	}
+	// Still absent? Then it is genuinely missing, and apply lists the fields of
+	// the FRESH copy — the ones a reader should actually choose between.
+	return r.apply(fresh.Data)
 }
 
 // explain turns a failed read into something a person can act on.
@@ -508,17 +574,23 @@ func (c *Client) explain(path string, status int, err error) error {
   the path has never been written, or every version of it was deleted.`, path)
 	case 0:
 		// No status: the request never completed.
-		cached := "and nothing is cached for it"
 		if _, ok := c.cache.get(path); ok {
-			cached = "though a cached copy exists (this should not have been reached)"
+			// Only a refresh gets here: a cached copy exists and Resolve went back
+			// to Bao because that copy lacked a field. The caller says so.
+			return unavailableErr(`cannot reach OpenBao at %s to refresh %s.
+
+  %v
+
+  If Bao is SEALED it must be unsealed by hand — it does not auto-unseal.`,
+				c.addr, path, err)
 		}
-		return unavailableErr(`cannot reach OpenBao at %s %s.
+		return unavailableErr(`cannot reach OpenBao at %s and nothing is cached for it.
 
   %v
 
   A provisioned deployment keeps working from cache; reaching this means this
   path has never been fetched on this host. If Bao is SEALED it must be unsealed
-  by hand — it does not auto-unseal.`, c.addr, cached, err)
+  by hand — it does not auto-unseal.`, c.addr, err)
 	default:
 		return configErr("read %s: HTTP %d: %v", path, status, err)
 	}
