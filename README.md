@@ -60,6 +60,21 @@ The tool gets the same durability from a **disk cache** instead:
 - an **uncached** reference fails **loudly, naming the path** — never an empty
   string
 
+★ **A cached path missing the requested field is not a hit.** When a field is
+added to a path that is already cached, the cached copy cannot answer for it, so
+`get`/`env` re-fetch that path from Bao **once**:
+
+- Bao has the field → the cache is updated with the fresh copy and it resolves.
+- Bao does not have it either → exit 3, `no field`, listing the fields of the
+  **fresh** copy.
+- Bao is unreachable, sealed or denies the read → exit 3, and the message says
+  the *cached* copy lacks the field and why the refresh failed. **The cache is
+  left untouched**, so every field it does have keeps serving.
+
+Without this, a field added after first caching read as `no field` forever (or
+until a `watch` poll, on hosts that run one), and the fix was deleting the cache
+file by hand. A request for a field the cached copy *has* still never touches Bao.
+
 > ⚠️ A Bao Agent's own cache does **not** do this. It is a token/lease cache, not
 > a KV response cache: with the server stopped, a read through an agent in
 > `api_proxy` mode returns `HTTP 000`. Measured, not assumed — it is why this
@@ -186,7 +201,8 @@ baoist-monk: cannot read kv/adx/forbidden: permission denied
     3. is the AppRole bound to that policy?
 ```
 
-A missing field lists what *is* present. A selector landing on an object lists
+A missing field lists what *is* present — in the freshly re-fetched copy, or, if
+Bao could not be reached for that refresh, in the cached one, saying so. A selector landing on an object lists
 its fields and suggests the deeper selector. A missing credential file says which
 file and what it is for — it is a **configuration** error, not an availability
 one, even though it surfaces before any HTTP request happens.
@@ -236,3 +252,8 @@ Two tests are load-bearing rather than incidental:
 - **a cache hit contacting nothing** — three references into one record must
   cost one read, which is what makes per-operation resolution cheap enough to
   replace a pre-rendered file.
+
+The field-refresh tests pin the boundary between them: a field the cached copy
+has is resolved with Bao *closed*, so a re-fetch that crept onto the hit path
+would fail it; and a failed refresh must leave the cache file byte-for-byte
+unchanged.

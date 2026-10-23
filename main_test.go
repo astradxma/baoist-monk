@@ -340,6 +340,204 @@ func TestResolve_CacheHitDoesNotContactBao(t *testing.T) {
 	}
 }
 
+// ── A field added to a path that is already cached ──────────────────────────
+//
+// ★ The bug these cover: kv/adx/forgejo/app was cached on theserver, then
+// RUNNER_SECRET_SEAGULL_CI was added to it in Bao two days later. Every `bm get`
+// for the new field answered from the cached copy — "no field", exit 3 — and
+// never asked Bao, because a cache hit never does. It took deleting the cache
+// file by hand. Every service that grows a field on an existing path hits this.
+
+// cacheFile is the on-disk copy for a path, for asserting it changed or did not.
+func cacheFile(t *testing.T, c *Client, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(c.cache.file(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// A field present in the cache is still a pure cache hit: adding the re-fetch
+// must not have made every read go to Bao. Bao is CLOSED for the second read, so
+// any contact at all would fail it.
+func TestResolve_FieldPresentInCacheDoesNotContactBao(t *testing.T) {
+	f := newFakeBao(t)
+	f.secrets["kv/adx/forgejo/app"] = map[string]any{"SECRET_KEY": "k", "nested": map[string]any{"secret": "s"}}
+	c := testClient(t, f)
+	if _, err := c.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#SECRET_KEY")); err != nil {
+		t.Fatal(err)
+	}
+	f.srv.Close()
+
+	for sel, want := range map[string]string{"SECRET_KEY": "k", "nested.secret": "s"} {
+		got, err := c.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#"+sel))
+		if err != nil || got != want {
+			t.Errorf("#%s: got %q, %v — a cached field went to Bao", sel, got, err)
+		}
+	}
+	if n := atomic.LoadInt64(&f.reads); n != 1 {
+		t.Errorf("%d data reads, want 1", n)
+	}
+}
+
+// ★★ The regression test. Cached copy lacks the field, Bao has it: re-fetch
+// once, update the cache, resolve. Covers a flat field and a nested selector.
+func TestResolve_FieldAddedSinceCachingIsRefetched(t *testing.T) {
+	for _, c := range []struct{ name, sel, want string }{
+		{"flat", "RUNNER_SECRET_SEAGULL_CI", "runner-s3cret"},
+		{"nested", "forgejo.secret", "nested-s3cret"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeBao(t)
+			f.secrets["kv/adx/forgejo/app"] = map[string]any{"SECRET_KEY": "k"}
+			cl := testClient(t, f)
+			if _, err := cl.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#SECRET_KEY")); err != nil {
+				t.Fatal(err)
+			}
+
+			// Two days later someone adds a field, as a new version.
+			f.version = 2
+			f.secrets["kv/adx/forgejo/app"] = map[string]any{
+				"SECRET_KEY":               "k",
+				"RUNNER_SECRET_SEAGULL_CI": "runner-s3cret",
+				"forgejo":                  map[string]any{"secret": "nested-s3cret"},
+			}
+
+			got, err := cl.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#"+c.sel))
+			if err != nil {
+				t.Fatalf("a field added after caching did not resolve: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+			if n := atomic.LoadInt64(&f.reads); n != 2 {
+				t.Errorf("%d data reads, want 2 (the first fetch and exactly one refresh)", n)
+			}
+
+			// The cache now holds the fresh copy: a new process, with Bao gone,
+			// resolves the new field without contacting anything.
+			e, _ := cl.cache.get("kv/adx/forgejo/app")
+			if e.Version != 2 {
+				t.Errorf("cached version %d after refresh, want 2", e.Version)
+			}
+			f.srv.Close()
+			if got, err := NewClient().Resolve(mustParse(t, "bao:kv/adx/forgejo/app#"+c.sel)); err != nil || got != c.want {
+				t.Errorf("the refreshed copy was not cached: %q %v", got, err)
+			}
+		})
+	}
+}
+
+// Missing from the cache AND from Bao: exit 3 exactly as before, but listing the
+// fields of the FRESH copy — those are the ones to choose between.
+func TestResolve_FieldMissingEverywhereListsTheFreshFields(t *testing.T) {
+	f := newFakeBao(t)
+	f.secrets["kv/adx/forgejo/app"] = map[string]any{"SECRET_KEY": "k"}
+	c := testClient(t, f)
+	if _, err := c.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#SECRET_KEY")); err != nil {
+		t.Fatal(err)
+	}
+	f.version = 2
+	f.secrets["kv/adx/forgejo/app"] = map[string]any{"SECRET_KEY": "k", "JWT_SECRET": "j"}
+
+	got, err := c.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#NOPE"))
+	if err == nil {
+		t.Fatalf("a field missing everywhere resolved to %q", got)
+	}
+	if code := exitCodeFor(err); code != 3 {
+		t.Errorf("exit code %d, want 3", code)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `no field "NOPE"`) || !strings.Contains(msg, "Present: JWT_SECRET, SECRET_KEY") {
+		t.Errorf("message does not list the fresh copy's fields:\n%s", msg)
+	}
+	if strings.Contains(msg, "could not be reached") {
+		t.Errorf("Bao WAS reached, but the message says otherwise:\n%s", msg)
+	}
+	if n := atomic.LoadInt64(&f.reads); n != 2 {
+		t.Errorf("%d data reads, want 2 — one refresh, no loop", n)
+	}
+	if e, _ := c.cache.get("kv/adx/forgejo/app"); e.Version != 2 {
+		t.Errorf("the fresh copy was not cached (version %d, want 2)", e.Version)
+	}
+}
+
+// ★ Missing from the cache and Bao unreachable — closed, or denying the read: the
+// cache must be byte-for-byte untouched (a sealed Bao must never cost the host
+// the fields it DOES have), exit 3, and the message must say the CACHED copy
+// lacks the field and the refresh failed, with the reason.
+func TestResolve_FieldMissingAndBaoUnreachableLeavesCacheAlone(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		break_ func(f *fakeBao)
+		reason string
+	}{
+		{"closed", func(f *fakeBao) { f.srv.Close() }, "cannot reach OpenBao"},
+		{"denied", func(f *fakeBao) { f.forbid["kv/adx/forgejo/app"] = true }, "permission denied"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeBao(t)
+			f.secrets["kv/adx/forgejo/app"] = map[string]any{"SECRET_KEY": "k"}
+			cl := testClient(t, f)
+			if _, err := cl.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#SECRET_KEY")); err != nil {
+				t.Fatal(err)
+			}
+			before := cacheFile(t, cl, "kv/adx/forgejo/app")
+			c.break_(f)
+
+			got, err := cl.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#RUNNER_SECRET_SEAGULL_CI"))
+			if err == nil {
+				t.Fatalf("resolved %q from nowhere", got)
+			}
+			if code := exitCodeFor(err); code != 3 {
+				t.Errorf("exit code %d, want 3\n%v", code, err)
+			}
+			msg := err.Error()
+			for _, want := range []string{
+				`no field "RUNNER_SECRET_SEAGULL_CI"`,
+				"Present: SECRET_KEY",
+				"cached copy lacks this field",
+				"could not be reached to refresh",
+				c.reason,
+			} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("message is missing %q:\n%s", want, msg)
+				}
+			}
+			if strings.Contains(msg, "nothing is cached") {
+				t.Errorf("message claims nothing is cached:\n%s", msg)
+			}
+			if after := cacheFile(t, cl, "kv/adx/forgejo/app"); string(after) != string(before) {
+				t.Errorf("a failed refresh modified the cache:\nbefore %s\nafter  %s", before, after)
+			}
+			// And the fields it does have still serve.
+			if v, err := cl.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#SECRET_KEY")); err != nil || v != "k" {
+				t.Errorf("a cached field stopped serving after a failed refresh: %q %v", v, err)
+			}
+		})
+	}
+}
+
+// Never print a value. The messages above name fields; they must not carry the
+// secret of a sibling field from either copy.
+func TestResolve_RefreshMessagesNeverCarryValues(t *testing.T) {
+	f := newFakeBao(t)
+	f.secrets["kv/adx/forgejo/app"] = map[string]any{"SECRET_KEY": "do-not-print-me"}
+	c := testClient(t, f)
+	if _, err := c.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#SECRET_KEY")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#NOPE"))
+	f.srv.Close()
+	_, err2 := c.Resolve(mustParse(t, "bao:kv/adx/forgejo/app#NOPE"))
+	for _, e := range []error{err, err2} {
+		if e == nil || strings.Contains(e.Error(), "do-not-print-me") {
+			t.Errorf("error leaked a value or was nil: %v", e)
+		}
+	}
+}
+
 // An UNCACHED reference with Bao unreachable must fail loudly as `unavailable`
 // (4), never as an empty string. An empty credential is the failure that reaches
 // S3 as a 403 inside a job hours later.
